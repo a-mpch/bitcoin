@@ -557,6 +557,44 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     break;
                 }
 
+                case OP_EXPIRE:
+                {
+                    // if (!(flags & SCRIPT_VERIFY_EXPIRE)) {
+                    //     // not enabled; treat as a NOP4
+                    //     break;
+                    // }
+
+                    if (stack.size() < 1)
+                        return set_error(serror, SCRIPT_ERR_INVALID_STACK_OPERATION);
+
+                    // Note that elsewhere numeric opcodes are limited to
+                    // operands in the range -2**31+1 to 2**31-1, however it is
+                    // legal for opcodes to produce results exceeding that
+                    // range. This limitation is implemented by CScriptNum's
+                    // default 4-byte limit.
+                    //
+                    // If we kept to that limit we'd have a year 2038 problem,
+                    // even though the nLockTime field in transactions
+                    // themselves is uint32 which only becomes meaningless
+                    // after the year 2106.
+                    //
+                    // Thus as a special case we tell CScriptNum to accept up
+                    // to 5-byte bignums, which are good until 2**39-1, well
+                    // beyond the 2**32-1 limit of the nLockTime field itself.
+                    const CScriptNum nExpireHeight(stacktop(-1), fRequireMinimal, 5);
+
+                    // In the rare event that the argument may be < 0 due to
+                    // some arithmetic being done first, you can always use
+                    // 0 MAX CHECKLOCKTIMEVERIFY.
+                    if (nExpireHeight < 0)
+                        return set_error(serror, SCRIPT_ERR_NEGATIVE_EXPIRE_TIME);
+                    // Actually compare the specified lock time with the transaction.
+                    if (!checker.CheckExpireHeight(nExpireHeight))
+                        return set_error(serror, SCRIPT_ERR_UNSATISFIED_EXPIRE_TIME);
+
+                    break;
+                }
+
                 case OP_CHECKSEQUENCEVERIFY:
                 {
                     if (!(flags & SCRIPT_VERIFY_CHECKSEQUENCEVERIFY)) {
@@ -591,7 +629,7 @@ bool EvalScript(std::vector<std::vector<unsigned char> >& stack, const CScript& 
                     break;
                 }
 
-                case OP_NOP1: case OP_NOP4: case OP_NOP5:
+                case OP_NOP1: case OP_NOP5:
                 case OP_NOP6: case OP_NOP7: case OP_NOP8: case OP_NOP9: case OP_NOP10:
                 {
                     if (flags & SCRIPT_VERIFY_DISCOURAGE_UPGRADABLE_NOPS)
@@ -1723,6 +1761,52 @@ bool GenericTransactionSignatureChecker<T>::CheckLockTime(const CScriptNum& nLoc
     // been finalized by setting nSequence to maxint. The
     // transaction would be allowed into the blockchain, making
     // the opcode ineffective.
+    //
+    // Testing if this vin is not final is sufficient to
+    // prevent this condition. Alternatively we could test all
+    // inputs, but testing just this input minimizes the data
+    // required to prove correct CHECKLOCKTIMEVERIFY execution.
+    if (CTxIn::SEQUENCE_FINAL == txTo->vin[nIn].nSequence)
+        return false;
+
+    return true;
+}
+
+template <class T>
+bool GenericTransactionSignatureChecker<T>::CheckExpireHeight(const CScriptNum& nExpireHeight) const
+{
+    // This prototype implementation is heavely inspired by
+    // the implementation of CheckLockTime (Anti-CheckLockTime)
+    // but going to prune some edge cases that might not be
+    // relevant for final implementation in Tapscript.
+    // Given that we want to compare apples to apples, and
+    // probably final implementation will use annex data from
+    // taproot script or other form, this will only use
+    // lock-by-blockheight. So fail the script unless nLockTime is
+    // less than LOCKTIME_THRESHOLD.
+    if (
+        (txTo->nLockTime >=  LOCKTIME_THRESHOLD || nExpireHeight >=  LOCKTIME_THRESHOLD)
+    )
+        return false;
+
+    // Now, get the first 16bits from the nVersion field that
+    // indicates the delta amount of blocks. This transaction
+    // will be valid from the nLockTime field.
+    int64_t deltaExpireHeight = txTo->version >> 16;
+    int64_t absoluteExpireHeight = (int64_t)txTo->nLockTime + deltaExpireHeight;
+
+    // Now that we know we're comparing apples-to-apples,
+    // (blocks-to-blocks) comparison is a simple numeric one.
+    // We are comparing the absolute expire height of the
+    // transaction to the nExpireHeight field from the stack.
+    if (nExpireHeight >= absoluteExpireHeight)
+        return false;
+
+    // Finally the nLockTime feature can be disabled in IsFinalTx()
+    // and thus CHECKLOCKTIMEVERIFY bypassed if every txin has
+    // been finalized by setting nSequence to maxint. Then,
+    // EXPIRE also will be bypassed. The transaction would be allowed
+    // into the blockchain, making the opcode ineffective.
     //
     // Testing if this vin is not final is sufficient to
     // prevent this condition. Alternatively we could test all

@@ -53,6 +53,10 @@ std::string ScriptErrorString(const ScriptError serror)
             return "Negative locktime";
         case SCRIPT_ERR_UNSATISFIED_LOCKTIME:
             return "Locktime requirement not satisfied";
+        case SCRIPT_ERR_UNSATISFIED_EXPIRE_TIME:
+            return "Expire time requirement not satisfied";
+        case SCRIPT_ERR_NEGATIVE_EXPIRE_TIME:
+            return "Negative expire time";
         case SCRIPT_ERR_SIG_HASHTYPE:
             return "Signature hash type missing or not understood";
         case SCRIPT_ERR_SIG_DER:
