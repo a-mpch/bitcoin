@@ -385,6 +385,7 @@ BASE_SCRIPTS = [
     'feature_logging.py',
     'feature_anchors.py',
     'feature_expire.py',
+    'mempool_replacement_eas_package.py',
     'mempool_datacarrier.py',
     'feature_coinstatsindex.py',
     'wallet_orphanedreward.py',
