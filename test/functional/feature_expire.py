@@ -49,11 +49,10 @@ def expire_modify_tx(tx, prepend_scriptsig, nsequence=None, nlocktime=None, delt
     tx.vin[0].scriptSig = CScript(prepend_scriptsig + list(CScript(tx.vin[0].scriptSig)))
     tx.rehash()
 
-def recalculate_version(tx, deltaHeight):
+def recalculate_version(tx, deltaheight):
     serialized_version = tx.version.to_bytes(4, "little")
-    serialized_delta_height = deltaHeight.to_bytes(2, "little")
     high_bytes_int = int.from_bytes(serialized_version[2:4], "little")
-    new_high_bytes_int = high_bytes_int + deltaHeight
+    new_high_bytes_int = high_bytes_int + deltaheight
     new_high_bytes_int &= 0xffff
     new_high_bytes = new_high_bytes_int.to_bytes(2, "little")
     new_version_bytes = serialized_version[:2] + new_high_bytes

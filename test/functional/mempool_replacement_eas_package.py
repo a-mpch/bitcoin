@@ -26,6 +26,7 @@ from test_framework.util import (
 
 from test_framework.script import (
         CScript,
+        CScriptNum,
         hash160,
         OP_IF,
         OP_HASH160,
@@ -46,6 +47,7 @@ from test_framework.script import (
         SIGHASH_ALL,
         SIGHASH_SINGLE,
         SIGHASH_ANYONECANPAY,
+        OP_EXPIRE
 )
 
 from test_framework.test_framework import BitcoinTestFramework
@@ -97,14 +99,36 @@ def generate_parent_child_tx(wallet, coin, pubkey, sat_per_vbyte):
 
     return (junk_parent, child_tx)
 
+def recalculate_version(tx, deltaheight):
+    serialized_version = tx.version.to_bytes(4, "little")
+    high_bytes_int = int.from_bytes(serialized_version[2:4], "little")
+    new_high_bytes_int = high_bytes_int + deltaheight
+    new_high_bytes_int &= 0xffff
+    new_high_bytes = new_high_bytes_int.to_bytes(2, "little")
+    new_version_bytes = serialized_version[:2] + new_high_bytes
+    return int.from_bytes(new_version_bytes, "little")
+
+def current_witness_script(fundee_seckey, funder_seckey, hashlock):
+    return CScript([fundee_seckey.get_pubkey().get_bytes(), OP_SWAP, OP_SIZE, 32,
+        OP_EQUAL, OP_NOTIF, OP_DROP, 2, OP_SWAP, funder_seckey.get_pubkey().get_bytes(), 2, OP_CHECKMULTISIG, OP_ELSE,
+        OP_HASH160, hashlock, OP_EQUALVERIFY, OP_CHECKSIG, OP_ENDIF])
+
+def op_expire_witness_script(fundee_seckey, funder_seckey, hashlock, expire_height):
+    return CScript([
+        fundee_seckey.get_pubkey().get_bytes(), OP_SWAP, OP_SIZE, 32, OP_EQUAL,
+        OP_NOTIF,
+            OP_DROP, 2, OP_SWAP, funder_seckey.get_pubkey().get_bytes(), 2, OP_CHECKMULTISIG,
+        OP_ELSE,
+            CScriptNum(expire_height), OP_EXPIRE, OP_DROP, OP_HASH160, hashlock, OP_EQUALVERIFY, OP_CHECKSIG,
+        OP_ENDIF
+    ])
+
+
 def generate_preimage_tx(input_amount, sat_per_vbyte, funder_seckey, fundee_seckey, hashlock, commitment_tx, preimage_parent_tx):
 
     commitment_fee = 158 * 2 # Old sat per vbyte
 
-    witness_script = CScript([fundee_seckey.get_pubkey().get_bytes(), OP_SWAP, OP_SIZE, 32,
-        OP_EQUAL, OP_NOTIF, OP_DROP, 2, OP_SWAP, funder_seckey.get_pubkey().get_bytes(), 2, OP_CHECKMULTISIG, OP_ELSE,
-        OP_HASH160, hashlock, OP_EQUALVERIFY, OP_CHECKSIG, OP_ENDIF])
-
+    witness_script = current_witness_script(fundee_seckey, funder_seckey, hashlock)
     spend_script = CScript([OP_TRUE])
     spend_scriptpubkey = CScript([OP_0, sha256(spend_script)])
 
@@ -129,10 +153,11 @@ def generate_preimage_tx(input_amount, sat_per_vbyte, funder_seckey, fundee_seck
 
     return (receiver_preimage)
 
-def create_chan_state(funding_txid, funding_vout, funder_seckey, fundee_seckey, input_amount, input_script, sat_per_vbyte, timelock, hashlock, nSequence, preimage_parent_tx):
-    witness_script = CScript([fundee_seckey.get_pubkey().get_bytes(), OP_SWAP, OP_SIZE, 32,
-        OP_EQUAL, OP_NOTIF, OP_DROP, 2, OP_SWAP, funder_seckey.get_pubkey().get_bytes(), 2, OP_CHECKMULTISIG, OP_ELSE,
-        OP_HASH160, hashlock, OP_EQUALVERIFY, OP_CHECKSIG, OP_ENDIF])
+def create_chan_state(funding_txid, funding_vout, funder_seckey, fundee_seckey, input_amount, input_script, sat_per_vbyte, timelock, hashlock, nSequence, preimage_parent_tx, expire_height=None, current_height=None):
+    witness_script = current_witness_script(fundee_seckey, funder_seckey, hashlock)
+    if expire_height is not None:
+        witness_script = op_expire_witness_script(fundee_seckey, funder_seckey, hashlock, expire_height - 1)
+
     witness_program = sha256(witness_script)
     script_pubkey = CScript([OP_0, witness_program])
 
@@ -158,7 +183,12 @@ def create_chan_state(funding_txid, funding_vout, funder_seckey, fundee_seckey, 
     offerer_timeout.vin.append(CTxIn(COutPoint(int(commitment_tx.hash, 16), 0), b"", nSequence))
     offerer_timeout.vout.append(CTxOut(int(input_amount - (commitment_fee + timeout_fee)), spend_scriptpubkey))
     offerer_timeout.nLockTime = timelock
-
+    if expire_height is not None and current_height is not None:
+        offerer_timeout.version = recalculate_version(offerer_timeout, expire_height - offerer_timeout.nLockTime)
+        # commitment_tx.nLockTime = current_height
+        print("nLockTime is set to {}".format(offerer_timeout.nLockTime))
+        print("Version is set to {}".format(expire_height - offerer_timeout.nLockTime))
+        print("Exxpire height is {}".format(expire_height))
     sig_hash = SegwitV0SignatureHash(witness_script, offerer_timeout, 0, SIGHASH_ALL, commitment_tx.vout[0].nValue)
     funder_sig = funder_seckey.sign_ecdsa(sig_hash) + b'\x01'
     fundee_sig = fundee_seckey.sign_ecdsa(sig_hash) + b'\x01'
@@ -193,6 +223,14 @@ class ReplacementCyclingTest(BitcoinTestFramework):
 
     def set_test_params(self):
         self.num_nodes = 2
+        self.noban_tx_relay = True
+        self.extra_args = [[
+            '-par=1',  # Use only one script thread to get the exact reject reason for testing
+            '-acceptnonstdtxn=1',  # invalidate is nonstandard
+        ], [
+            '-par=1',  # Use only one script thread to get the exact reject reason for testing
+            '-acceptnonstdtxn=1',  # invalidate is nonstandard
+        ]]
 
     def test_replacement_cycling(self):
         alice = self.nodes[0]
@@ -363,12 +401,101 @@ class ReplacementCyclingTest(BitcoinTestFramework):
 
         self.log.info("Bob re-broadcasts his HTLC preimage transaction at block height {} to replace".format(blockheight_print))
 
-        # Bob can repeat this replacement cycling trick until an inbound HTLC of Alice expires and double-spend her routed HTLCs.
+    def test_fix_replacement_cycling(self):
+        alice = self.nodes[0]
+        alice_seckey = ECKey()
+        alice_seckey.generate(True)
+
+        bob = self.nodes[1]
+        bob_seckey = ECKey()
+        bob_seckey.generate(True)
+
+        self.generate(alice, 501)
+
+        self.sync_all()
+
+        coin_1 = self.wallet.get_utxo()
+        wallet = self.wallet
+
+        ab_funding_tx = generate_funding_chan(wallet, coin_1, alice_seckey.get_pubkey(), bob_seckey.get_pubkey())
+        ab_funding_txid = alice.sendrawtransaction(hexstring=ab_funding_tx.serialize().hex(), maxfeerate=0)
+
+        self.sync_all()
+        assert ab_funding_txid in alice.getrawmempool()
+        assert ab_funding_txid in bob.getrawmempool()
+
+        # We mine one block the Alice - Bob channel is opened.
+        self.generate(alice, 1)
+        assert_equal(len(alice.getrawmempool()), 0)
+        assert_equal(len(bob.getrawmempool()), 0)
+
+        lastblockhash = alice.getbestblockhash()
+        block = alice.getblock(lastblockhash)
+        lastblockheight = block['height']
+
+        hashlock = hash160(b'a' * 32)
+
+        funding_redeemscript = get_funding_redeemscript(alice_seckey.get_pubkey(), bob_seckey.get_pubkey())
+
+        coin_2 = self.wallet.get_utxo()
+
+        parent_seckey = ECKey()
+        parent_seckey.generate(True)
+
+        (bob_parent_tx, bob_child_tx) = generate_parent_child_tx(wallet, coin_2, parent_seckey.get_pubkey(), 1)
+
+        self.log.info("We generate new commitment transaction using op_expire in witness script. Expire height")
+
+
+        (new_ab_commitment_tx, new_alice_timeout_tx, new_bob_preimage_tx) = create_chan_state(ab_funding_txid, 0, alice_seckey, bob_seckey, 49.99998 * COIN, funding_redeemscript, 2, lastblockheight + 20, hashlock, 0x1, bob_parent_tx, lastblockheight + 20, lastblockheight)
+        new_ab_commitment_txid = alice.sendrawtransaction(hexstring=new_ab_commitment_tx.serialize().hex(), maxfeerate=0)
+
+        self.sync_all()
+
+        assert new_ab_commitment_txid in alice.getrawmempool()
+        assert new_ab_commitment_txid in bob.getrawmempool()
+
+        self.log.info("we can even test that preimage tx is accepted by mempool while is not expired")
+        self.generate(alice, 20)
+
+        assert_equal(len(alice.getrawmempool()), 0)
+        assert_equal(len(bob.getrawmempool()), 0)
+        # Broadcast the Bob parent transaction and its child transaction
+        bob_parent_txid = bob.sendrawtransaction(hexstring=bob_parent_tx.serialize().hex(), maxfeerate=0)
+        bob_child_txid = bob.sendrawtransaction(hexstring=bob_child_tx.serialize().hex(), maxfeerate=0)
+
+        self.sync_all()
+
+        assert bob_parent_txid in alice.getrawmempool()
+        assert bob_parent_txid in bob.getrawmempool()
+        assert bob_child_txid in alice.getrawmempool()
+        assert bob_child_txid in bob.getrawmempool()
+
+        lastblockhash = alice.getbestblockhash()
+        block = alice.getblock(lastblockhash)
+        blockheight_print = block['height']
+
+        self.log.info("Alice broadcasts her HTLC timeout transaction at block height {}".format(blockheight_print))
+
+        # Broadcast the Alice timeout transaction
+        print(self.nodes[0].testmempoolaccept(rawtxs=[new_alice_timeout_tx.serialize().hex()], maxfeerate=0))
+        alice_timeout_txid = alice.sendrawtransaction(hexstring=new_alice_timeout_tx.serialize().hex(), maxfeerate=0)
+        self.sync_all()
+
+        assert alice_timeout_txid in alice.getrawmempool()
+        assert alice_timeout_txid in bob.getrawmempool()
+
+        # Broadcast the Bob preimage transaction but fails
+        mempool_accept = bob.testmempoolaccept(rawtxs=[new_bob_preimage_tx.serialize().hex()], maxfeerate=0)
+        assert_equal(len(mempool_accept), 1)
+        assert_equal(mempool_accept[0]['allowed'], False)
+        assert_equal(mempool_accept[0]["reject-reason"], "mandatory-script-verify-flag-failed (Expire time requirement not satisfied)")
 
     def run_test(self):
         self.wallet = MiniWallet(self.nodes[0])
 
-        self.test_replacement_cycling()
+        # self.test_replacement_cycling()
+        self.test_fix_replacement_cycling()
 
 if __name__ == '__main__':
     ReplacementCyclingTest(__file__).main()
